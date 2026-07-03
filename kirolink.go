@@ -40,7 +40,18 @@ type RefreshResponse struct {
 	ExpiresAt    string `json:"expiresAt,omitempty"`
 }
 
-// AnthropicTool defines the Anthropic API tool structure
+type KiroCredentials struct {
+	AccessToken string
+	AuthMethod  string
+	ProfileArn  string
+	Region      string
+}
+
+const (
+	authMethodAPIKey  = "api_key"
+	defaultKiroRegion = "us-east-1"
+)
+
 type AnthropicTool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
@@ -310,6 +321,23 @@ var ModelMap = map[string]string{
 	"claude-4-opus":              modelOpus46,
 }
 
+var KiroAPIKeyModelMap = map[string]string{
+	"default":                    "claude-sonnet-4.5",
+	"claude-sonnet-5":            "claude-sonnet-5",
+	"claude-sonnet-4-6":          "claude-sonnet-4.5",
+	"claude-sonnet-4-5":          "claude-sonnet-4.5",
+	"claude-sonnet-4.5":          "claude-sonnet-4.5",
+	"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
+	"claude-sonnet-4-20250514":   "claude-sonnet-4.5",
+	"claude-haiku-4-5":           "claude-haiku-4.5",
+	"claude-haiku-4.5":           "claude-haiku-4.5",
+	"claude-haiku-4-5-20251001":  "claude-haiku-4.5",
+	"deepseek-3.2":               "deepseek-3.2",
+	"qwen3-coder-next":           "qwen3-coder-next",
+	"glm-5":                      "glm-5",
+	"minimax-m2.5":               "MiniMax-M2.5",
+}
+
 func resolveModelID(requested string) string {
 	key := strings.ToLower(strings.TrimSpace(requested))
 	if key == "" {
@@ -342,6 +370,49 @@ func resolveModelID(requested string) string {
 		// Safe default keeps Obsidian sessions working if it sends unknown aliases.
 		return modelSonnet46
 	}
+}
+
+func stripKiroSyntheticSuffixes(model string) string {
+	out := strings.TrimSpace(model)
+	for {
+		switch {
+		case strings.HasSuffix(out, "-agentic"):
+			out = strings.TrimSuffix(out, "-agentic")
+		case strings.HasSuffix(out, "-thinking"):
+			out = strings.TrimSuffix(out, "-thinking")
+		default:
+			return out
+		}
+	}
+}
+
+func resolveKiroAPIKeyModelID(requested string) string {
+	model := stripKiroSyntheticSuffixes(strings.TrimSpace(requested))
+	key := strings.ToLower(model)
+	if key == "" {
+		return KiroAPIKeyModelMap["default"]
+	}
+	if v, ok := KiroAPIKeyModelMap[key]; ok {
+		return v
+	}
+	if strings.HasPrefix(key, "claude-") || strings.HasPrefix(key, "deepseek-") || strings.HasPrefix(key, "qwen") || strings.HasPrefix(key, "glm-") || strings.HasPrefix(model, "MiniMax-") {
+		return model
+	}
+	switch {
+	case strings.Contains(key, "sonnet"):
+		return "claude-sonnet-4.5"
+	case strings.Contains(key, "haiku"):
+		return "claude-haiku-4.5"
+	default:
+		return KiroAPIKeyModelMap["default"]
+	}
+}
+
+func resolveModelIDForCredentials(requested string, creds KiroCredentials) string {
+	if creds.AuthMethod == authMethodAPIKey {
+		return resolveKiroAPIKeyModelID(requested)
+	}
+	return resolveModelID(requested)
 }
 
 // generateUUID generates a simple UUID v4
@@ -721,15 +792,19 @@ func hasToolResults(content any) bool {
 
 // buildCodeWhispererRequest builds a CodeWhisperer request
 func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererRequest {
-	profileArn := getProfileArn()
+	return buildCodeWhispererRequestWithCredentials(anthropicReq, credentialsFromAccessToken(""))
+}
+
+func buildCodeWhispererRequestWithCredentials(anthropicReq AnthropicRequest, creds KiroCredentials) CodeWhispererRequest {
+	profileArn := strings.TrimSpace(creds.ProfileArn)
 	cwReq := CodeWhispererRequest{
 		ProfileArn: profileArn,
 	}
 
-	resolvedModel := resolveModelID(anthropicReq.Model)
+	resolvedModel := resolveModelIDForCredentials(anthropicReq.Model, creds)
 	// Builder ID free tier only supports Claude 3.5 models.
 	// Builder ID free tier uses dot-notation model IDs (e.g. "claude-sonnet-4.5")
-	if profileArn == "" {
+	if os.Getenv("KIRO_BUILDER_ID_MODE") == "1" && profileArn == "" && creds.AuthMethod != authMethodAPIKey {
 		switch resolvedModel {
 		case modelSonnet46, modelSonnet45, modelOpus46:
 			resolvedModel = modelBuilderSonnet45
@@ -802,6 +877,9 @@ func buildCodeWhispererRequest(anthropicReq AnthropicRequest) CodeWhispererReque
 }
 
 func main() {
+	if err := loadDotEnv(".env"); err != nil {
+		fmt.Printf("Warning: failed to load .env: %v\n", err)
+	}
 	if len(os.Args) < 2 {
 		fmt.Println("Usage:")
 		fmt.Println("  kirolink read    - Read and display token")
@@ -941,6 +1019,165 @@ func getProfileArn() string {
 		return v
 	}
 	return "" // Builder ID free tier — no profileArn needed
+}
+
+func getKiroRegion(value string) string {
+	region := strings.TrimSpace(value)
+	if region == "" {
+		region = strings.TrimSpace(os.Getenv("KIRO_REGION"))
+	}
+	if region == "" {
+		return defaultKiroRegion
+	}
+	for _, r := range region {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return defaultKiroRegion
+		}
+	}
+	return region
+}
+
+func bearerTokenFromRequest(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if token := strings.TrimSpace(r.Header.Get("X-Kiro-API-Key")); token != "" {
+		return token
+	}
+	if token := strings.TrimSpace(r.Header.Get("X-API-Key")); token != "" {
+		return token
+	}
+	if token := strings.TrimSpace(r.Header.Get("x-api-key")); token != "" {
+		return token
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
+
+func parseDotEnvLine(line string) (string, string, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", "", false
+	}
+	line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+	idx := strings.Index(line, "=")
+	if idx <= 0 {
+		return "", "", false
+	}
+	key := strings.TrimSpace(line[:idx])
+	for _, r := range key {
+		if (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return "", "", false
+		}
+	}
+	value := strings.TrimSpace(line[idx+1:])
+	if len(value) >= 2 {
+		quote := value[0]
+		if (quote == '\'' || quote == '"') && value[len(value)-1] == quote {
+			value = value[1 : len(value)-1]
+		} else if hash := strings.Index(value, " #"); hash >= 0 {
+			value = strings.TrimSpace(value[:hash])
+		}
+	} else if hash := strings.Index(value, " #"); hash >= 0 {
+		value = strings.TrimSpace(value[:hash])
+	}
+	return key, value, true
+}
+
+func loadDotEnv(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := parseDotEnvLine(line)
+		if !ok {
+			continue
+		}
+		if _, exists := os.LookupEnv(key); !exists {
+			if err := os.Setenv(key, value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func getCredentials(r *http.Request) (KiroCredentials, error) {
+	if apiKey := strings.TrimSpace(os.Getenv("KIRO_API_KEY")); apiKey != "" {
+		return KiroCredentials{
+			AccessToken: apiKey,
+			AuthMethod:  authMethodAPIKey,
+			ProfileArn:  strings.TrimSpace(os.Getenv("KIRO_PROFILE_ARN")),
+			Region:      getKiroRegion(""),
+		}, nil
+	}
+
+	if os.Getenv("KIRO_AUTH_METHOD") == authMethodAPIKey {
+		if apiKey := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")); apiKey != "" {
+			return KiroCredentials{
+				AccessToken: apiKey,
+				AuthMethod:  authMethodAPIKey,
+				ProfileArn:  strings.TrimSpace(os.Getenv("KIRO_PROFILE_ARN")),
+				Region:      getKiroRegion(""),
+			}, nil
+		}
+	}
+
+	if apiKey := bearerTokenFromRequest(r); apiKey != "" {
+		profileArn := strings.TrimSpace(r.Header.Get("X-Kiro-Profile-Arn"))
+		if profileArn == "" {
+			profileArn = strings.TrimSpace(os.Getenv("KIRO_PROFILE_ARN"))
+		}
+		return KiroCredentials{
+			AccessToken: apiKey,
+			AuthMethod:  authMethodAPIKey,
+			ProfileArn:  profileArn,
+			Region:      getKiroRegion(r.Header.Get("X-Kiro-Region")),
+		}, nil
+	}
+
+	token, err := getToken()
+	if err != nil {
+		return KiroCredentials{}, err
+	}
+	return KiroCredentials{
+		AccessToken: token.AccessToken,
+		ProfileArn:  getProfileArn(),
+		Region:      getKiroRegion(""),
+	}, nil
+}
+
+func credentialsFromAccessToken(accessToken string) KiroCredentials {
+	return KiroCredentials{
+		AccessToken: accessToken,
+		ProfileArn:  getProfileArn(),
+		Region:      getKiroRegion(""),
+	}
+}
+
+func codeWhispererURL(creds KiroCredentials) string {
+	return fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", getKiroRegion(creds.Region))
+}
+
+func setCodeWhispererHeaders(req *http.Request, creds KiroCredentials) {
+	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.amazon.eventstream")
+	req.Header.Set("X-Amz-Target", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
+	req.Header.Set("User-Agent", "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0")
+	req.Header.Set("X-Amz-User-Agent", "aws-sdk-js/3.0.0 kiro-ide/1.0.0")
+	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
+	req.Header.Set("Amz-Sdk-Invocation-Id", generateUUID())
+	if creds.AuthMethod == authMethodAPIKey {
+		req.Header.Set("tokentype", "API_KEY")
+	}
 }
 
 // exportEnvVars exports environment variables
@@ -1086,11 +1323,10 @@ func startServer(port string) {
 			return
 		}
 
-		// Get current token
-		token, err := getToken()
+		creds, err := getCredentials(r)
 		if err != nil {
-			fmt.Printf("Error: Failed to get token: %v\n", err)
-			http.Error(w, fmt.Sprintf("Failed to get token: %v", err), http.StatusInternalServerError)
+			fmt.Printf("Error: Failed to get credentials: %v\n", err)
+			http.Error(w, fmt.Sprintf("Failed to get credentials: %v", err), http.StatusInternalServerError)
 			return
 		}
 
@@ -1138,7 +1374,7 @@ func startServer(port string) {
 						fmt.Printf("PANIC in streaming handler: %v\n", r)
 					}
 				}()
-				handleStreamRequest(w, anthropicReq, token.AccessToken)
+				handleStreamRequestWithCredentials(w, anthropicReq, creds)
 			}()
 			return
 		}
@@ -1151,7 +1387,7 @@ func startServer(port string) {
 					http.Error(w, fmt.Sprintf(`{"error":{"type":"server_error","message":"Internal panic: %v"}}`, r), http.StatusInternalServerError)
 				}
 			}()
-			handleNonStreamRequest(w, anthropicReq, token.AccessToken)
+			handleNonStreamRequestWithCredentials(w, anthropicReq, creds)
 		}()
 	}))
 
@@ -1528,6 +1764,10 @@ func buildAnthropicStreamEvents(conversationId, messageId, model string, inputTo
 
 // handleStreamRequest handles streaming requests
 func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, accessToken string) {
+	handleStreamRequestWithCredentials(w, anthropicReq, credentialsFromAccessToken(accessToken))
+}
+
+func handleStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq AnthropicRequest, creds KiroCredentials) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1543,7 +1783,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 	messageId := fmt.Sprintf("msg_%s", time.Now().Format("20060102150405"))
 
 	// Build CodeWhisperer request
-	cwReq := buildCodeWhispererRequest(anthropicReq)
+	cwReq := buildCodeWhispererRequestWithCredentials(anthropicReq, creds)
 
 	// Serialize with payload-size enforcement
 	cwReqBody, err := ensurePayloadFits(&cwReq)
@@ -1557,7 +1797,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 	// Create streaming proxy request
 	proxyReq, err := http.NewRequest(
 		http.MethodPost,
-		"https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+		codeWhispererURL(creds),
 		bytes.NewBuffer(cwReqBody),
 	)
 	if err != nil {
@@ -1566,9 +1806,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 	}
 
 	// Set request headers
-	proxyReq.Header.Set("Authorization", "Bearer "+accessToken)
-	proxyReq.Header.Set("Content-Type", "application/json")
-	proxyReq.Header.Set("Accept", "text/event-stream")
+	setCodeWhispererHeaders(proxyReq, creds)
 
 	// Send request with retry on "Improperly formed request"
 	client := &http.Client{}
@@ -1580,16 +1818,14 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 			// Rebuild the HTTP request with the (possibly trimmed) body
 			proxyReq, err = http.NewRequest(
 				http.MethodPost,
-				"https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+				codeWhispererURL(creds),
 				bytes.NewBuffer(cwReqBody),
 			)
 			if err != nil {
 				sendErrorEvent(w, flusher, "Failed to create retry request", err)
 				return
 			}
-			proxyReq.Header.Set("Authorization", "Bearer "+accessToken)
-			proxyReq.Header.Set("Content-Type", "application/json")
-			proxyReq.Header.Set("Accept", "text/event-stream")
+			setCodeWhispererHeaders(proxyReq, creds)
 		}
 
 		resp, err = client.Do(proxyReq)
@@ -1627,7 +1863,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 		}
 
 		// 403 = token expired — sync from Kiro CLI sqlite and retry once
-		if resp.StatusCode == 403 && attempt < maxRetries-1 {
+		if resp.StatusCode == 403 && creds.AuthMethod != authMethodAPIKey && attempt < maxRetries-1 {
 			fmt.Println("Token expired (403), syncing from Kiro CLI database...")
 			refreshToken()
 			newToken, tokenErr := getToken()
@@ -1635,7 +1871,7 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 				sendErrorEvent(w, flusher, "error", fmt.Errorf("Token sync failed: %s", tokenErr.Error()))
 				return
 			}
-			accessToken = newToken.AccessToken
+			creds.AccessToken = newToken.AccessToken
 			fmt.Println("Token synced, retrying request...")
 			continue
 		}
@@ -1673,8 +1909,12 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 
 // handleNonStreamRequest handles non-streaming requests
 func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, accessToken string) {
+	handleNonStreamRequestWithCredentials(w, anthropicReq, credentialsFromAccessToken(accessToken))
+}
+
+func handleNonStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq AnthropicRequest, creds KiroCredentials) {
 	// Build CodeWhisperer request
-	cwReq := buildCodeWhispererRequest(anthropicReq)
+	cwReq := buildCodeWhispererRequestWithCredentials(anthropicReq, creds)
 
 	// Serialize with payload-size enforcement
 	cwReqBody, err := ensurePayloadFits(&cwReq)
@@ -1689,7 +1929,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	// Create proxy request
 	proxyReq, err := http.NewRequest(
 		http.MethodPost,
-		"https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+		codeWhispererURL(creds),
 		bytes.NewBuffer(cwReqBody),
 	)
 	if err != nil {
@@ -1699,8 +1939,7 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	}
 
 	// Set request headers
-	proxyReq.Header.Set("Authorization", "Bearer "+accessToken)
-	proxyReq.Header.Set("Content-Type", "application/json")
+	setCodeWhispererHeaders(proxyReq, creds)
 
 	// Send request
 	client := &http.Client{}

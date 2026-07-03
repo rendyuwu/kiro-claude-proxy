@@ -1,6 +1,10 @@
 # Binary
 kiro-claude-proxy
 kiro-claude-proxy.exe
+kirolink
+
+# Env
+.env
 
 # Logs
 *.log

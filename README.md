@@ -21,13 +21,14 @@
 ![API](https://img.shields.io/badge/API-Compatible-964B00?logo=anthropic&logoColor=white)
 ![AWS CodeWhisperer](https://img.shields.io/badge/AWS-CodeWhisperer-232F3E?logo=amazon-aws&logoColor=white)
 
-`kirolink` is a small Go CLI that reads Kiro auth tokens from your local SSO cache, then exposes an Anthropic-shaped local API so tools like Claude Code can talk to it without a bunch of manual bullshit.
+`kirolink` is a small Go CLI that exposes an Anthropic-shaped local API for Kiro. It can use a Kiro/CodeWhisperer API key from `.env` or environment variables, with the old local SSO cache path kept as a fallback.
 
-In practice: your client sends `POST /v1/messages` to this proxy, the proxy translates the request to AWS CodeWhisperer, sends it to the CodeWhisperer API, and translates the response back on the way out.
+In practice: your client sends `POST /v1/messages` to this proxy, the proxy translates the request to Kiro's CodeWhisperer runtime, sends it with Kiro API-key compatible headers, and translates the response back on the way out.
 
 ## What this thing actually does
 
-- Reads tokens from `~/.aws/sso/cache/kiro-auth-token.json`
+- Reads Kiro API-key credentials from `.env`, process env, or request headers
+- Falls back to `~/.aws/sso/cache/kiro-auth-token.json` when no API key is configured
 - Prints shell-ready `ANTHROPIC_*` environment variable setup
 - Starts a local server on port `8080` by default
 - Exposes these endpoints:
@@ -52,21 +53,25 @@ Default path: `~/.aws/sso/cache/kiro-auth-token.json`
 go build -o kirolink kirolink.go
 ```
 
-### 2. Make sure Kiro is already logged in
+### 2. Configure a Kiro API key
 
-This tool expects a token file at:
+Create `.env` in the repo root:
+
+```env
+KIRO_API_KEY=your_kiro_api_key
+KIRO_REGION=us-east-1
+KIRO_PROFILE_ARN=
+```
+
+`KIRO_PROFILE_ARN` is optional. If you set it, make sure it belongs to the API key's account.
+
+You can also pass the API key per request with `Authorization: Bearer ...`, `x-api-key`, or `X-Kiro-API-Key`.
+
+If no API key is configured, `kirolink` falls back to the old local SSO cache path:
 
 ```text
 ~/.aws/sso/cache/kiro-auth-token.json
 ```
-
-If you want to sanity-check that file first:
-
-```bash
-./kirolink read
-```
-
-Heads-up: `read` prints both the access token and refresh token, so maybe don't paste that shit into screenshots.
 
 ### 3. Export the Anthropic env vars
 
@@ -86,6 +91,8 @@ By default this sets:
 
 - `ANTHROPIC_BASE_URL=http://localhost:8080`
 - `ANTHROPIC_API_KEY=<current access token>`
+
+With `KIRO_API_KEY` in `.env`, the server ignores the local SSO cache for chat requests. `ANTHROPIC_API_KEY` can be any client-side placeholder unless you want to pass the Kiro key through request headers.
 
 ### 4. Start the proxy
 
@@ -114,15 +121,15 @@ Claude Code and other Anthropic-compatible clients can use the exported env vars
 ```bash
 curl -X POST http://localhost:8080/v1/messages \
   -H "Content-Type: application/json" \
-  -d '{"model":"claude-sonnet-4-5-20250929","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}'
+  -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}'
 ```
 
 ## Commands
 
 | Command                    | What it does                                                                                 |
 | -------------------------- | -------------------------------------------------------------------------------------------- |
-| `./kirolink read`          | Reads and prints the cached token data.                                                      |
-| `./kirolink refresh`       | Refreshes the token using the stored refresh token and writes the updated file back to disk. |
+| `./kirolink read`          | Reads and prints the fallback cached token data.                                             |
+| `./kirolink refresh`       | Syncs the fallback token from Kiro CLI sqlite and writes the token cache.                    |
 | `./kirolink export`        | Prints environment variable commands for the current OS/shell style.                         |
 | `./kirolink claude`        | Updates `~/.claude.json` and sets `hasCompletedOnboarding=true` plus `kirolink=true`.        |
 | `./kirolink server [port]` | Starts the local Anthropic-compatible proxy server.                                          |
@@ -143,25 +150,25 @@ curl http://localhost:8080/v1/models
 
 ## Model aliases
 
-The proxy currently exposes multiple Anthropic-style aliases, including:
+The proxy accepts multiple Anthropic-style aliases, including:
 
 - `default`
 - `claude-sonnet-4-6`
 - `claude-sonnet-4-5`
-- `claude-opus-4-6`
+- `claude-haiku-4-5`
 - `claude-haiku-4-5-20251001`
 - `claude-4-sonnet`
-- `claude-4-opus`
 
-If you want the full live list, ask the running server with `GET /v1/models`.
+In API-key mode these map to Kiro upstream IDs like `claude-sonnet-4.5` and `claude-haiku-4.5`.
 
 ## How it works
 
-1. Read the token from your local Kiro SSO cache.
+1. Load `.env`, then resolve credentials from `KIRO_API_KEY`, request headers, or the fallback SSO cache.
 2. Accept Anthropic-style requests over HTTP.
-3. Translate them into the backend request format.
-4. Send them to `https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse`.
-5. Translate the response back into Anthropic-style JSON or SSE.
+3. Translate them into the existing CodeWhisperer request payload.
+4. Send them to `https://codewhisperer.<region>.amazonaws.com/generateAssistantResponse`.
+5. In API-key mode, send `Authorization: Bearer <key>` plus `tokentype: API_KEY`.
+6. Translate the response back into Anthropic-style JSON or SSE.
 
 ## Using with OpenClaw
 
@@ -205,17 +212,18 @@ go test ./protocol -v
 
 ## Rough edges you should know about
 
-- This tool depends on a local Kiro token file already existing.
-- `refresh` writes back to `~/.aws/sso/cache/kiro-auth-token.json`.
+- API-key mode expects `KIRO_API_KEY` in `.env`, process env, or request headers.
+- Fallback SSO mode still depends on a local Kiro token file.
+- `refresh` writes back to `~/.aws/sso/cache/kiro-auth-token.json` for fallback SSO mode.
 - `claude` modifies `~/.claude.json`; that's convenient, but it's still changing your config, so don't run it blindly.
 - The documented export path is hardcoded to `http://localhost:8080`.
-- The upstream CodeWhisperer endpoint is hardcoded to `https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse`.
+- The upstream CodeWhisperer endpoint is region-aware through `KIRO_REGION`, defaulting to `us-east-1`.
 
 | Feature            | Supported natively | Handled by `kirolink` | Notes                    |
 | :----------------- | :----------------: | :-------------------: | :----------------------- |
 | Standard Messaging |         ❌         |          ✅           | Translated cleanly       |
 | Streaming (SSE)    |         ❌         |          ✅           | Handled dynamically      |
-| Local Auth         |         ❌         |          ✅           | Auto-reads AWS SSO cache |
+| Local Auth         |         ❌         |          ✅           | API key or SSO fallback  |
 | Tool Use           |         ❌         |          ✅           | Tool-use/Mcp            |
 
 ## Credits

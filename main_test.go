@@ -178,6 +178,53 @@ func TestHandleStreamRequestCharacterizationTextOnly(t *testing.T) {
 	}
 }
 
+func TestHandleNonStreamRequestWithAPIKeyHeaders(t *testing.T) {
+	body := encodeAssistantFrame(t, map[string]any{"content": "api key ok"})
+	var upstreamReq *http.Request
+	var upstreamBody []byte
+	withTestTransport(t, func(req *http.Request) (*http.Response, error) {
+		upstreamReq = req
+		var err error
+		upstreamBody, err = io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("read upstream request: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(body)),
+		}, nil
+	})
+
+	recorder := httptest.NewRecorder()
+	handleNonStreamRequestWithCredentials(recorder, AnthropicRequest{
+		Model:    "claude-sonnet-4-6",
+		Messages: []AnthropicRequestMessage{{Role: "user", Content: "hello"}},
+	}, KiroCredentials{AccessToken: "kiro-api-key", AuthMethod: authMethodAPIKey, Region: "us-west-2"})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamReq == nil {
+		t.Fatalf("expected upstream request")
+	}
+	if got := upstreamReq.URL.String(); got != "https://codewhisperer.us-west-2.amazonaws.com/generateAssistantResponse" {
+		t.Fatalf("unexpected upstream URL %q", got)
+	}
+	if got := upstreamReq.Header.Get("Authorization"); got != "Bearer kiro-api-key" {
+		t.Fatalf("unexpected Authorization header %q", got)
+	}
+	if got := upstreamReq.Header.Get("tokentype"); got != "API_KEY" {
+		t.Fatalf("unexpected tokentype header %q", got)
+	}
+	if got := upstreamReq.Header.Get("X-Amz-Target"); got != "AmazonCodeWhispererStreamingService.GenerateAssistantResponse" {
+		t.Fatalf("unexpected target header %q", got)
+	}
+	if !strings.Contains(string(upstreamBody), `"modelId":"claude-sonnet-4.5"`) {
+		t.Fatalf("expected API-key model id in upstream body, got %s", string(upstreamBody))
+	}
+}
+
 func TestHandleNonStreamRequestCharacterizationMixedTextToolKeepsBothBlocks(t *testing.T) {
 	toolInput := `{"query":"drift"}`
 	body := bytes.Join([][]byte{
@@ -238,6 +285,37 @@ func TestHandleNonStreamRequestCharacterizationMixedTextToolKeepsBothBlocks(t *t
 	}
 }
 
+func TestLoadDotEnvDoesNotOverrideExistingEnv(t *testing.T) {
+	tempDir := t.TempDir()
+	envPath := filepath.Join(tempDir, ".env")
+	if err := os.WriteFile(envPath, []byte("KIROLINK_DOTENV_TEST=loaded\nKIROLINK_DOTENV_KEEP=from_file\nQUOTED=\"hello world\"\nexport EXPORTED=yes # comment\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	t.Setenv("KIROLINK_DOTENV_KEEP", "from_env")
+	t.Cleanup(func() {
+		os.Unsetenv("KIROLINK_DOTENV_TEST")
+		os.Unsetenv("QUOTED")
+		os.Unsetenv("EXPORTED")
+	})
+
+	if err := loadDotEnv(envPath); err != nil {
+		t.Fatalf("loadDotEnv: %v", err)
+	}
+
+	if got := os.Getenv("KIROLINK_DOTENV_TEST"); got != "loaded" {
+		t.Fatalf("expected .env value to load, got %q", got)
+	}
+	if got := os.Getenv("KIROLINK_DOTENV_KEEP"); got != "from_env" {
+		t.Fatalf("expected existing env to win, got %q", got)
+	}
+	if got := os.Getenv("QUOTED"); got != "hello world" {
+		t.Fatalf("expected quoted value, got %q", got)
+	}
+	if got := os.Getenv("EXPORTED"); got != "yes" {
+		t.Fatalf("expected exported value, got %q", got)
+	}
+}
+
 func TestSetClaudeUpdatesClaudeConfig(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
@@ -245,7 +323,7 @@ func TestSetClaudeUpdatesClaudeConfig(t *testing.T) {
 	claudeConfigPath := filepath.Join(tempHome, ".claude.json")
 	initial := map[string]any{
 		"hasCompletedOnboarding": false,
-		legacyClaudeConfigKey():   true,
+		legacyClaudeConfigKey():  true,
 		"theme":                  "dark",
 	}
 	data, err := json.Marshal(initial)
