@@ -88,6 +88,22 @@ func TestResolveModelIDCharacterization(t *testing.T) {
 	}
 }
 
+func TestResolveKiroAPIKeyModelIDPreservesLiveOpusAlias(t *testing.T) {
+	tests := map[string]string{
+		"claude-opus-4-6":          "claude-opus-4.6",
+		"claude-opus-4.8-thinking": "claude-opus-4.8",
+		"claude-sonnet-4-6":        "claude-sonnet-4.6",
+		"claude-haiku-4-5":         "claude-haiku-4.5",
+	}
+	for input, want := range tests {
+		t.Run(input, func(t *testing.T) {
+			if got := resolveKiroAPIKeyModelID(input); got != want {
+				t.Fatalf("resolveKiroAPIKeyModelID(%q) = %q, want %q", input, got, want)
+			}
+		})
+	}
+}
+
 func TestBuildCodeWhispererRequestCharacterizationPreservesCallerContext(t *testing.T) {
 	req := AnthropicRequest{
 		Model:  "totally-unknown-model-alias",
@@ -220,7 +236,7 @@ func TestHandleNonStreamRequestWithAPIKeyHeaders(t *testing.T) {
 	if got := upstreamReq.Header.Get("X-Amz-Target"); got != "AmazonCodeWhispererStreamingService.GenerateAssistantResponse" {
 		t.Fatalf("unexpected target header %q", got)
 	}
-	if !strings.Contains(string(upstreamBody), `"modelId":"claude-sonnet-4.5"`) {
+	if !strings.Contains(string(upstreamBody), `"modelId":"claude-sonnet-4.6"`) {
 		t.Fatalf("expected API-key model id in upstream body, got %s", string(upstreamBody))
 	}
 }

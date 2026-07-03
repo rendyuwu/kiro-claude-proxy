@@ -155,11 +155,15 @@ The proxy accepts multiple Anthropic-style aliases, including:
 - `default`
 - `claude-sonnet-4-6`
 - `claude-sonnet-4-5`
+- `claude-opus-4-8`
+- `claude-opus-4-7`
+- `claude-opus-4-6`
 - `claude-haiku-4-5`
 - `claude-haiku-4-5-20251001`
 - `claude-4-sonnet`
+- `claude-4-opus`
 
-In API-key mode these map to Kiro upstream IDs like `claude-sonnet-4.5` and `claude-haiku-4.5`.
+In API-key mode these map to Kiro upstream IDs like `claude-opus-4.6`, `claude-sonnet-4.6`, and `claude-haiku-4.5`.
 
 ## How it works
 
