@@ -1,0 +1,8 @@
+.git
+.env
+*.log
+kirolink
+kiro-claude-proxy
+kiro-claude-proxy.exe
+Dockerfile
+.dockerignore
