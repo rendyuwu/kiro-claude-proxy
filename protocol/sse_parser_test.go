@@ -146,3 +146,110 @@ func TestParseEventsMetadataPing(t *testing.T) {
 		t.Fatalf("expected ping data type, got %#v", got)
 	}
 }
+
+func TestParseEventsMetricsCamelCase(t *testing.T) {
+	frames := encodeTestFrame(t, map[string]any{
+		"inputTokens":              100.0,
+		"outputTokens":             50.0,
+		"cacheReadInputTokens":     80.0,
+		"cacheCreationInputTokens": 20.0,
+	})
+	events := ParseEvents(frames)
+
+	metrics := findMetricsEvent(t, events)
+	if got := metrics["input_tokens"]; got != 100 {
+		t.Fatalf("expected input_tokens 100, got %#v", got)
+	}
+	if got := metrics["output_tokens"]; got != 50 {
+		t.Fatalf("expected output_tokens 50, got %#v", got)
+	}
+	if got := metrics["cache_read_input_tokens"]; got != 80 {
+		t.Fatalf("expected cache_read_input_tokens 80, got %#v", got)
+	}
+	if got := metrics["cache_creation_input_tokens"]; got != 20 {
+		t.Fatalf("expected cache_creation_input_tokens 20, got %#v", got)
+	}
+}
+
+func TestParseEventsMetricsSnakeCaseAndNested(t *testing.T) {
+	frames := bytes.Join([][]byte{
+		encodeTestFrame(t, map[string]any{
+			"input_tokens":            7,
+			"cache_read_input_tokens": 3,
+		}),
+		encodeTestFrame(t, map[string]any{
+			"metricsEvent": map[string]any{"inputTokens": 9, "outputTokens": 4},
+		}),
+	}, nil)
+	events := ParseEvents(frames)
+
+	metrics := findMetricsEvent(t, events)
+	if got := metrics["input_tokens"]; got != 7 {
+		t.Fatalf("expected snake input_tokens 7, got %#v", got)
+	}
+	if got := metrics["cache_read_input_tokens"]; got != 3 {
+		t.Fatalf("expected snake cache_read_input_tokens 3, got %#v", got)
+	}
+}
+
+func TestParseEventsRejectsOversizedHeaderNoHugeAlloc(t *testing.T) {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.BigEndian, uint32(0xFFFFFFFF)); err != nil {
+		t.Fatalf("write totalLen: %v", err)
+	}
+	if err := binary.Write(&buf, binary.BigEndian, uint32(0xFFFFFFFF)); err != nil {
+		t.Fatalf("write headerLen: %v", err)
+	}
+
+	events := ParseEvents(buf.Bytes())
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events for oversized header, got %d", len(events))
+	}
+}
+
+func TestParseEventsRejectsHeaderBeyondTotalLenNoPanic(t *testing.T) {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.BigEndian, uint32(100)); err != nil {
+		t.Fatalf("write totalLen: %v", err)
+	}
+	if err := binary.Write(&buf, binary.BigEndian, uint32(200)); err != nil {
+		t.Fatalf("write headerLen: %v", err)
+	}
+	// Trailing bytes large enough that io.ReadFull would succeed if the bounds
+	// checks were missing — this exercises the negative-payloadLen panic path.
+	buf.Write(make([]byte, 200))
+
+	events := ParseEvents(buf.Bytes())
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events for header beyond totalLen, got %d", len(events))
+	}
+}
+
+func TestParseEventsRejectsTinyTotalLen(t *testing.T) {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.BigEndian, uint32(15)); err != nil {
+		t.Fatalf("write totalLen: %v", err)
+	}
+	if err := binary.Write(&buf, binary.BigEndian, uint32(0)); err != nil {
+		t.Fatalf("write headerLen: %v", err)
+	}
+
+	events := ParseEvents(buf.Bytes())
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events for tiny totalLen, got %d", len(events))
+	}
+}
+
+func findMetricsEvent(t *testing.T, events []SSEEvent) map[string]any {
+	t.Helper()
+	for _, e := range events {
+		if e.Event == "metrics" {
+			if data, ok := e.Data.(map[string]any); ok {
+				return data
+			}
+			t.Fatalf("metrics event data not a map: %#v", e.Data)
+		}
+	}
+	t.Fatalf("expected a metrics event, got %#v", events)
+	return nil
+}

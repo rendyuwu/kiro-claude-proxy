@@ -274,6 +274,11 @@ type CodeWhispererRequest struct {
 		History []any `json:"history"`
 	} `json:"conversationState"`
 	ProfileArn string `json:"profileArn,omitempty"`
+	// SystemPrompt carries the system context top-level; Kiro CLI/KAS sends it
+	// there, but the CodeWhisperer surface does not always honor it for direct
+	// calls, so it is ALSO embedded in the first user turn (see
+	// buildUserMessageWithSystem). Mirrors 9router claude-to-kiro.js.
+	SystemPrompt string `json:"systemPrompt,omitempty"`
 }
 
 // CodeWhispererEvent defines a CodeWhisperer event response
@@ -295,14 +300,14 @@ const (
 	modelBuilderHaiku45  = "claude-haiku-4.5"
 	modelBuilderSonnet35 = "CLAUDE_3_5_SONNET_20241022_V2_0" // last-resort fallback
 
-	// IAM Identity Center profile ARN (paid/enterprise accounts)
-	// Leave empty for Builder ID (free tier) accounts
-	profileArnIAM = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
-
 	// Payload safety limits for CodeWhisperer
 	maxToolDescLen  = 200    // max characters per tool description
 	maxPayloadBytes = 250000 // ~250KB soft limit for total request JSON
 )
+
+// httpClient is shared across requests so connections pool. It uses
+// http.DefaultTransport per call, so tests that swap DefaultTransport still work.
+var httpClient = &http.Client{}
 
 var ModelMap = map[string]string{
 	"default":                    modelSonnet45,
@@ -448,6 +453,15 @@ func generateDeterministicUUID(seed string) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
+// debugPrintf only emits when KIROLINK_DEBUG=1. Full request/response bodies
+// contain private conversation content and must not accumulate in logs by
+// default, especially under docker restart: unless-stopped.
+func debugPrintf(format string, args ...any) {
+	if os.Getenv("KIROLINK_DEBUG") != "" {
+		fmt.Printf(format, args...)
+	}
+}
+
 // truncateString truncates a string to maxLen, appending "..." if truncated.
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
@@ -556,9 +570,11 @@ func ensurePayloadFits(cwReq *CodeWhispererRequest) ([]byte, error) {
 
 	fmt.Printf("[payload-trim] initial size %d bytes, limit %d\n", len(data), maxPayloadBytes)
 
-	// Phase 1: Trim history from the front (oldest caller context first)
-	for len(data) > maxPayloadBytes && len(cwReq.ConversationState.History) > 0 {
-		cwReq.ConversationState.History = trimOldestHistoryMessage(cwReq.ConversationState.History)
+	// Phase 1: Trim history from index 1 onward, never history[0]. history[0] is
+	// the pinned cacheable prefix (first user turn); trimming it would destroy
+	// the upstream cache on every oversized request.
+	for len(data) > maxPayloadBytes && len(cwReq.ConversationState.History) > 1 {
+		cwReq.ConversationState.History = trimHistoryKeepFirst(cwReq.ConversationState.History)
 		data, err = jsonStr.Marshal(cwReq)
 		if err != nil {
 			return nil, err
@@ -616,6 +632,18 @@ func trimOldestHistoryMessage(history []any) []any {
 	return history[1:]
 }
 
+// trimHistoryKeepFirst drops the oldest history entry AFTER index 0, preserving
+// the pinned first user message (the cacheable prefix). Requires len >= 2.
+func trimHistoryKeepFirst(history []any) []any {
+	if len(history) <= 1 {
+		return history
+	}
+	out := make([]any, 0, len(history)-1)
+	out = append(out, history[0])
+	out = append(out, history[2:]...)
+	return out
+}
+
 func keepMostRecentHistory(history []any, keep int) []any {
 	if keep <= 0 || len(history) == 0 {
 		return nil
@@ -638,12 +666,24 @@ func buildSystemContext(system []AnthropicSystemMessage) string {
 
 func buildCurrentMessageContent(anthropicReq AnthropicRequest) string {
 	lastMsg := anthropicReq.Messages[len(anthropicReq.Messages)-1]
-	parts := make([]string, 0, 2)
-	if systemContext := buildSystemContext(anthropicReq.System); systemContext != "" {
-		parts = append(parts, fmt.Sprintf("<context>\n%s\n</context>", systemContext))
+	return buildTaskContent(getMessageContent(lastMsg.Content))
+}
+
+// buildTaskContent wraps a user turn in the stable <task> boundary marker.
+func buildTaskContent(content string) string {
+	return fmt.Sprintf("<task>\n%s\n</task>", content)
+}
+
+// buildUserMessageWithSystem builds the first user turn: system context plus
+// the task marker. The exact same bytes must appear as the current message on
+// turn 1 and as history[0] on every later turn so the upstream request prefix
+// stays byte-identical and stays cacheable. No timestamp, no cross-request
+// state — purely positional and deterministic.
+func buildUserMessageWithSystem(systemContext, content string) string {
+	if systemContext == "" {
+		return buildTaskContent(content)
 	}
-	parts = append(parts, fmt.Sprintf("<task>\n%s\n</task>", getMessageContent(lastMsg.Content)))
-	return strings.Join(parts, "\n\n")
+	return fmt.Sprintf("<context>\n%s\n</context>\n\n%s", systemContext, buildTaskContent(content))
 }
 
 // extractToolResults extracts tool_result blocks from an Anthropic message content
@@ -841,7 +881,17 @@ func buildCodeWhispererRequestWithCredentials(anthropicReq AnthropicRequest, cre
 		cwReq.ConversationState.ConversationId = generateUUID()
 	}
 
-	cwReq.ConversationState.CurrentMessage.UserInputMessage.Content = buildCurrentMessageContent(anthropicReq)
+	systemContext := buildSystemContext(anthropicReq.System)
+	cwReq.SystemPrompt = systemContext
+
+	// Turn 1 (no history): the system context rides in the current message so
+	// that message becomes the cacheable prefix. Later turns pin the same bytes
+	// into history[0] instead; the current message carries only <task>.
+	currentContent := buildCurrentMessageContent(anthropicReq)
+	if len(anthropicReq.Messages) == 1 {
+		currentContent = buildUserMessageWithSystem(systemContext, getMessageContent(anthropicReq.Messages[0].Content))
+	}
+	cwReq.ConversationState.CurrentMessage.UserInputMessage.Content = currentContent
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.ModelId = resolvedModel
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.Origin = "AI_EDITOR"
 
@@ -859,6 +909,7 @@ func buildCodeWhispererRequestWithCredentials(anthropicReq AnthropicRequest, cre
 
 	// Build history from caller-provided conversation only.
 	history := make([]any, 0, len(anthropicReq.Messages)-1)
+	systemInjected := false
 	for i := 0; i < len(anthropicReq.Messages)-1; i++ {
 		msg := anthropicReq.Messages[i]
 		content := getMessageContent(msg.Content)
@@ -875,7 +926,16 @@ func buildCodeWhispererRequestWithCredentials(anthropicReq AnthropicRequest, cre
 		}
 
 		userMsg := HistoryUserMessage{}
-		userMsg.UserInputMessage.Content = content
+		userContent := content
+		if !systemInjected && len(history) == 0 && systemContext != "" {
+			// history[0] is a user message: freeze it with the system context so
+			// it is byte-identical to turn 1's current message (cacheable prefix).
+			// If history[0] is assistant/tool-shaped, skip injection and rely on
+			// the top-level systemPrompt field only.
+			userContent = buildUserMessageWithSystem(systemContext, content)
+			systemInjected = true
+		}
+		userMsg.UserInputMessage.Content = userContent
 		userMsg.UserInputMessage.ModelId = resolvedModel
 		userMsg.UserInputMessage.Origin = "AI_EDITOR"
 
@@ -957,9 +1017,22 @@ func readToken() {
 		os.Exit(1)
 	}
 
+	full := false
+	for _, arg := range os.Args[2:] {
+		if arg == "--full" {
+			full = true
+		}
+	}
+
 	fmt.Println("Token Information:")
-	fmt.Printf("Access Token: %s\n", token.AccessToken)
-	fmt.Printf("Refresh Token: %s\n", token.RefreshToken)
+	if full {
+		fmt.Printf("Access Token: %s\n", token.AccessToken)
+		fmt.Printf("Refresh Token: %s\n", token.RefreshToken)
+	} else {
+		// Full tokens are sensitive; print a prefix by default. Use --full to debug.
+		fmt.Printf("Access Token: %s\n", truncateString(token.AccessToken, 15))
+		fmt.Printf("Refresh Token: %s\n", truncateString(token.RefreshToken, 15))
+	}
 	if token.ExpiresAt != "" {
 		fmt.Printf("Expires at: %s\n", token.ExpiresAt)
 	}
@@ -1177,19 +1250,36 @@ func credentialsFromAccessToken(accessToken string) KiroCredentials {
 	}
 }
 
-func codeWhispererURL(creds KiroCredentials) string {
-	return fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", getKiroRegion(creds.Region))
+// isCodeWhispererHost reports whether rawURL points at the legacy
+// codewhisperer.* surface. API_KEY traffic goes to the Amazon Q surface
+// (q.*) instead, which is the host that accepts API-key auth.
+func isCodeWhispererHost(rawURL string) bool {
+	return strings.Contains(rawURL, "://codewhisperer.")
 }
 
-func setCodeWhispererHeaders(req *http.Request, creds KiroCredentials) {
+func codeWhispererURL(creds KiroCredentials) string {
+	region := getKiroRegion(creds.Region)
+	if creds.AuthMethod == authMethodAPIKey {
+		// API-key accounts use the Amazon Q surface. The legacy codewhisperer.*
+		// endpoint authenticates the key but rejects the same valid payload with
+		// REQUEST_BODY_INVALID (mirrors 9router executors/kiro.js).
+		return fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region)
+	}
+	return fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region)
+}
+
+func setCodeWhispererHeaders(req *http.Request, creds KiroCredentials, rawURL string) {
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/vnd.amazon.eventstream")
-	req.Header.Set("X-Amz-Target", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
 	req.Header.Set("User-Agent", "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0")
 	req.Header.Set("X-Amz-User-Agent", "aws-sdk-js/3.0.0 kiro-ide/1.0.0")
 	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 	req.Header.Set("Amz-Sdk-Invocation-Id", generateUUID())
+	// X-Amz-Target is only valid on the legacy CodeWhisperer host; q.* rejects it.
+	if isCodeWhispererHost(rawURL) {
+		req.Header.Set("X-Amz-Target", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
+	}
 	if creds.AuthMethod == authMethodAPIKey {
 		req.Header.Set("tokentype", "API_KEY")
 	}
@@ -1354,7 +1444,7 @@ func startServer(port string) {
 		}
 		defer r.Body.Close()
 
-		fmt.Printf("\n=========================Anthropic Request Body:\n%s\n=======================================\n", string(body))
+		debugPrintf("\n=========================Anthropic Request Body:\n%s\n=======================================\n", string(body))
 
 		// Parse Anthropic request
 		var anthropicReq AnthropicRequest
@@ -1472,9 +1562,12 @@ type anthropicResponseBlock struct {
 }
 
 type translatedAnthropicResponse struct {
-	Blocks       []anthropicResponseBlock
-	StopReason   string
-	OutputTokens int
+	Blocks                   []anthropicResponseBlock
+	StopReason               string
+	OutputTokens             int
+	InputTokens              int
+	CacheReadInputTokens     int
+	CacheCreationInputTokens int
 }
 
 func responseModelID(cwReq CodeWhispererRequest, anthropicReq AnthropicRequest) string {
@@ -1494,6 +1587,9 @@ func assembleAnthropicResponse(events []protocol.SSEEvent) translatedAnthropicRe
 	order := []int{}
 	stopReason := ""
 	outputTokens := 0
+	inputTokens := 0
+	cacheReadInputTokens := 0
+	cacheCreationInputTokens := 0
 
 	ensureBlock := func(index int, blockType string) *blockAccumulator {
 		if block, ok := blocks[index]; ok {
@@ -1569,11 +1665,33 @@ func assembleAnthropicResponse(events []protocol.SSEEvent) translatedAnthropicRe
 					stopReason = reason
 				}
 			}
+		case "metrics":
+			// Real token usage from the upstream metricsEvent. When present it
+			// replaces the counted deltas / byte-length estimates, and the cache
+			// fields make upstream cache hits visible (cache_read > 0 on turn >= 2).
+			if n := eventIndex(dataMap["input_tokens"]); n > inputTokens {
+				inputTokens = n
+			}
+			if n := eventIndex(dataMap["output_tokens"]); n > outputTokens {
+				outputTokens = n
+			}
+			if n := eventIndex(dataMap["cache_read_input_tokens"]); n > cacheReadInputTokens {
+				cacheReadInputTokens = n
+			}
+			if n := eventIndex(dataMap["cache_creation_input_tokens"]); n > cacheCreationInputTokens {
+				cacheCreationInputTokens = n
+			}
 		}
 	}
 
 	sort.Ints(order)
-	translated := translatedAnthropicResponse{StopReason: stopReason, OutputTokens: outputTokens}
+	translated := translatedAnthropicResponse{
+		StopReason:               stopReason,
+		OutputTokens:             outputTokens,
+		InputTokens:              inputTokens,
+		CacheReadInputTokens:     cacheReadInputTokens,
+		CacheCreationInputTokens: cacheCreationInputTokens,
+	}
 	translated.Blocks = make([]anthropicResponseBlock, 0, len(order))
 
 	for _, index := range order {
@@ -1620,7 +1738,7 @@ func eventIndex(value any) int {
 	}
 }
 
-func buildAnthropicResponsePayload(conversationId, model string, inputTokens int, translated translatedAnthropicResponse) map[string]any {
+func buildAnthropicResponsePayload(conversationId, model string, translated translatedAnthropicResponse) map[string]any {
 	content := make([]map[string]any, 0, len(translated.Blocks))
 	for _, block := range translated.Blocks {
 		switch block.Type {
@@ -1639,6 +1757,17 @@ func buildAnthropicResponsePayload(conversationId, model string, inputTokens int
 		}
 	}
 
+	usage := map[string]any{
+		"input_tokens":  translated.InputTokens,
+		"output_tokens": translated.OutputTokens,
+	}
+	if translated.CacheReadInputTokens > 0 {
+		usage["cache_read_input_tokens"] = translated.CacheReadInputTokens
+	}
+	if translated.CacheCreationInputTokens > 0 {
+		usage["cache_creation_input_tokens"] = translated.CacheCreationInputTokens
+	}
+
 	return map[string]any{
 		"content":         content,
 		"model":           model,
@@ -1647,14 +1776,22 @@ func buildAnthropicResponsePayload(conversationId, model string, inputTokens int
 		"stop_sequence":   nil,
 		"type":            "message",
 		"conversation_id": conversationId,
-		"usage": map[string]any{
-			"input_tokens":  inputTokens,
-			"output_tokens": translated.OutputTokens,
-		},
+		"usage":           usage,
 	}
 }
 
-func buildAnthropicStreamEvents(conversationId, messageId, model string, inputTokens int, translated translatedAnthropicResponse) []protocol.SSEEvent {
+func buildAnthropicStreamEvents(conversationId, messageId, model string, translated translatedAnthropicResponse) []protocol.SSEEvent {
+	startUsage := map[string]any{
+		"input_tokens":  translated.InputTokens,
+		"output_tokens": 1,
+	}
+	if translated.CacheReadInputTokens > 0 {
+		startUsage["cache_read_input_tokens"] = translated.CacheReadInputTokens
+	}
+	if translated.CacheCreationInputTokens > 0 {
+		startUsage["cache_creation_input_tokens"] = translated.CacheCreationInputTokens
+	}
+
 	events := []protocol.SSEEvent{{
 		Event: "message_start",
 		Data: map[string]any{
@@ -1668,10 +1805,7 @@ func buildAnthropicStreamEvents(conversationId, messageId, model string, inputTo
 				"stop_reason":     nil,
 				"stop_sequence":   nil,
 				"conversation_id": conversationId,
-				"usage": map[string]any{
-					"input_tokens":  inputTokens,
-					"output_tokens": 1,
-				},
+				"usage":           startUsage,
 			},
 		},
 	}, {
@@ -1807,12 +1941,13 @@ func handleStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq Anth
 		return
 	}
 
-	fmt.Printf("CodeWhisperer streaming request body:\n%s\n", string(cwReqBody))
+	debugPrintf("CodeWhisperer streaming request body:\n%s\n", string(cwReqBody))
 
 	// Create streaming proxy request
+	cwURL := codeWhispererURL(creds)
 	proxyReq, err := http.NewRequest(
 		http.MethodPost,
-		codeWhispererURL(creds),
+		cwURL,
 		bytes.NewBuffer(cwReqBody),
 	)
 	if err != nil {
@@ -1821,11 +1956,9 @@ func handleStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq Anth
 	}
 
 	// Set request headers
-	setCodeWhispererHeaders(proxyReq, creds)
+	setCodeWhispererHeaders(proxyReq, creds, cwURL)
 
 	// Send request with retry on "Improperly formed request"
-	client := &http.Client{}
-
 	var resp *http.Response
 	const maxRetries = 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -1833,17 +1966,17 @@ func handleStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq Anth
 			// Rebuild the HTTP request with the (possibly trimmed) body
 			proxyReq, err = http.NewRequest(
 				http.MethodPost,
-				codeWhispererURL(creds),
+				cwURL,
 				bytes.NewBuffer(cwReqBody),
 			)
 			if err != nil {
 				sendErrorEvent(w, flusher, "Failed to create retry request", err)
 				return
 			}
-			setCodeWhispererHeaders(proxyReq, creds)
+			setCodeWhispererHeaders(proxyReq, creds, cwURL)
 		}
 
-		resp, err = client.Do(proxyReq)
+		resp, err = httpClient.Do(proxyReq)
 		if err != nil {
 			sendErrorEvent(w, flusher, "CodeWhisperer request error", fmt.Errorf("request error: %s", err.Error()))
 			return
@@ -1856,7 +1989,8 @@ func handleStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq Anth
 		respBodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		respStr := string(respBodyBytes)
-		fmt.Printf("CodeWhisperer STREAM response error, status code: %d, response: %s\n", resp.StatusCode, respStr)
+		fmt.Printf("CodeWhisperer STREAM response error, status code: %d\n", resp.StatusCode)
+		debugPrintf("CodeWhisperer STREAM response error body: %s\n", respStr)
 
 		if resp.StatusCode == 400 && strings.Contains(respStr, "Improperly formed request") && attempt < maxRetries-1 {
 			fmt.Printf("CodeWhisperer STREAM improperly formed request; retrying with trimmed payload (attempt %d)\n", attempt+1)
@@ -1904,15 +2038,30 @@ func handleStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq Anth
 
 	// os.WriteFile(messageId+"response.raw", respBody, 0644)
 
-	parsedEvents := protocol.ParseEvents(respBody)
+	// A corrupt upstream frame must not kill the stream; recover and emit an
+	// SSE error event instead. The parser now bounds-checkes frame sizes, but a
+	// defensive recover keeps a bug there from taking the whole proxy down.
+	var parsedEvents []protocol.SSEEvent
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				fmt.Printf("PANIC parsing upstream events: %v\n", rec)
+				sendErrorEvent(w, flusher, "error", fmt.Errorf("upstream event parse failure"))
+			}
+		}()
+		parsedEvents = protocol.ParseEvents(respBody)
+	}()
 
 	if len(parsedEvents) > 0 {
 		translated := assembleAnthropicResponse(parsedEvents)
+		if translated.InputTokens == 0 {
+			// No metrics event upstream; fall back to the old byte-length estimate.
+			translated.InputTokens = len(cwReq.ConversationState.CurrentMessage.UserInputMessage.Content)
+		}
 		streamEvents := buildAnthropicStreamEvents(
 			cwReq.ConversationState.ConversationId,
 			messageId,
 			responseModelID(cwReq, anthropicReq),
-			len(cwReq.ConversationState.CurrentMessage.UserInputMessage.Content),
 			translated,
 		)
 		for _, event := range streamEvents {
@@ -1939,12 +2088,13 @@ func handleNonStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq A
 		return
 	}
 
-	fmt.Printf("CodeWhisperer request body:\n%s\n", string(cwReqBody))
+	debugPrintf("CodeWhisperer request body:\n%s\n", string(cwReqBody))
 
 	// Create proxy request
+	cwURL := codeWhispererURL(creds)
 	proxyReq, err := http.NewRequest(
 		http.MethodPost,
-		codeWhispererURL(creds),
+		cwURL,
 		bytes.NewBuffer(cwReqBody),
 	)
 	if err != nil {
@@ -1954,12 +2104,10 @@ func handleNonStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq A
 	}
 
 	// Set request headers
-	setCodeWhispererHeaders(proxyReq, creds)
+	setCodeWhispererHeaders(proxyReq, creds, cwURL)
 
 	// Send request
-	client := &http.Client{}
-
-	resp, err := client.Do(proxyReq)
+	resp, err := httpClient.Do(proxyReq)
 	if err != nil {
 		fmt.Printf("Error: Failed to send request: %v\n", err)
 		http.Error(w, fmt.Sprintf("Failed to send request: %v", err), http.StatusInternalServerError)
@@ -1975,7 +2123,7 @@ func handleNonStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq A
 		return
 	}
 
-	fmt.Printf("CodeWhisperer response body:\n%s\n", string(cwRespBody))
+	debugPrintf("CodeWhisperer response body:\n%s\n", string(cwRespBody))
 
 	respBodyStr := string(cwRespBody)
 
@@ -1983,16 +2131,20 @@ func handleNonStreamRequestWithCredentials(w http.ResponseWriter, anthropicReq A
 
 	// Check if response is an error
 	if strings.Contains(string(cwRespBody), "Improperly formed request.") {
-		fmt.Printf("Error: CodeWhisperer returned incorrect format: %s\n", respBodyStr)
+		fmt.Printf("Error: CodeWhisperer returned incorrect format\n")
+		debugPrintf("CodeWhisperer incorrect format body: %s\n", respBodyStr)
 		http.Error(w, fmt.Sprintf("Request format error: %s", respBodyStr), http.StatusBadRequest)
 		return
 	}
 
 	// Build Anthropic response
+	if translated.InputTokens == 0 {
+		// No metrics event upstream; fall back to the old byte-length estimate.
+		translated.InputTokens = len(cwReq.ConversationState.CurrentMessage.UserInputMessage.Content)
+	}
 	anthropicResp := buildAnthropicResponsePayload(
 		cwReq.ConversationState.ConversationId,
 		responseModelID(cwReq, anthropicReq),
-		len(cwReq.ConversationState.CurrentMessage.UserInputMessage.Content),
 		translated,
 	)
 
@@ -2009,8 +2161,8 @@ func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string,
 		return
 	}
 
-	fmt.Printf("event: %s\n", eventType)
-	fmt.Printf("data: %v\n\n", string(json))
+	debugPrintf("event: %s\n", eventType)
+	debugPrintf("data: %v\n\n", string(json))
 
 	fmt.Fprintf(w, "event: %s\n", eventType)
 	fmt.Fprintf(w, "data: %s\n\n", string(json))

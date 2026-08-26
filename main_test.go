@@ -121,8 +121,11 @@ func TestBuildCodeWhispererRequestCharacterizationPreservesCallerContext(t *test
 	if current.ModelId != modelSonnet46 {
 		t.Fatalf("expected fallback model %q, got %q", modelSonnet46, current.ModelId)
 	}
-	if !strings.Contains(current.Content, req.System[0].Text) {
-		t.Fatalf("expected current content to include system context, got %q", current.Content)
+	if cwReq.SystemPrompt != req.System[0].Text {
+		t.Fatalf("expected top-level systemPrompt to carry system context, got %q", cwReq.SystemPrompt)
+	}
+	if strings.Contains(current.Content, req.System[0].Text) {
+		t.Fatalf("system context must live in history[0], not the current message, got %q", current.Content)
 	}
 	if !strings.Contains(current.Content, "<task>\nCurrent question\n</task>") {
 		t.Fatalf("expected task wrapper in current content, got %q", current.Content)
@@ -138,8 +141,9 @@ func TestBuildCodeWhispererRequestCharacterizationPreservesCallerContext(t *test
 	}
 
 	firstUser, ok := history[0].(HistoryUserMessage)
-	if !ok || firstUser.UserInputMessage.Content != "Earlier question" {
-		t.Fatalf("expected first history entry to be the caller user turn, got %#v", history[0])
+	wantFirst := "<context>\nFollow the caller's instructions.\n</context>\n\n<task>\nEarlier question\n</task>"
+	if !ok || firstUser.UserInputMessage.Content != wantFirst {
+		t.Fatalf("expected first history entry to be the caller user turn with system context, got %#v", history[0])
 	}
 	firstAssistant, ok := history[1].(HistoryAssistantMessage)
 	if !ok || firstAssistant.AssistantResponseMessage.Content != "Earlier answer" {
@@ -150,6 +154,68 @@ func TestBuildCodeWhispererRequestCharacterizationPreservesCallerContext(t *test
 		if userMsg, ok := entry.(HistoryUserMessage); ok && strings.Contains(userMsg.UserInputMessage.Content, "identity") {
 			t.Fatalf("did not expect synthetic identity history, got %#v", history)
 		}
+	}
+}
+
+func TestCacheStableHistoryFirstUserMessage(t *testing.T) {
+	system := []AnthropicSystemMessage{{Type: "text", Text: "You are a helpful assistant."}}
+	turn1 := AnthropicRequest{
+		Model:    "claude-sonnet-4-6",
+		System:   system,
+		Messages: []AnthropicRequestMessage{{Role: "user", Content: "Hello"}},
+	}
+	turn2 := AnthropicRequest{
+		Model:  "claude-sonnet-4-6",
+		System: system,
+		Messages: []AnthropicRequestMessage{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi there"},
+			{Role: "user", Content: "How are you?"},
+		},
+	}
+
+	cw1 := buildCodeWhispererRequest(turn1)
+	cw2 := buildCodeWhispererRequest(turn2)
+
+	turn1Current := cw1.ConversationState.CurrentMessage.UserInputMessage.Content
+	h0, ok := cw2.ConversationState.History[0].(HistoryUserMessage)
+	if !ok {
+		t.Fatalf("expected history[0] to be a user message, got %T", cw2.ConversationState.History[0])
+	}
+	if h0.UserInputMessage.Content != turn1Current {
+		t.Fatalf("history[0] not byte-identical to turn 1 current message:\n  turn1 current=%q\n  turn2 history0=%q", turn1Current, h0.UserInputMessage.Content)
+	}
+
+	// The current message on turn 2 must not repeat the system context.
+	turn2Current := cw2.ConversationState.CurrentMessage.UserInputMessage.Content
+	if strings.Contains(turn2Current, "helpful assistant") {
+		t.Fatalf("turn 2 current message should not repeat system context, got %q", turn2Current)
+	}
+	if !strings.Contains(turn2Current, "<task>\nHow are you?\n</task>") {
+		t.Fatalf("expected current task wrapper, got %q", turn2Current)
+	}
+
+	// Turn 1 and turn 2 share the same conversation seed.
+	if cw1.ConversationState.ConversationId != cw2.ConversationState.ConversationId {
+		t.Fatalf("expected stable conversation id, got %q vs %q", cw1.ConversationState.ConversationId, cw2.ConversationState.ConversationId)
+	}
+}
+
+func TestCodeWhispererURLAuthMethodRouting(t *testing.T) {
+	apiKey := KiroCredentials{AccessToken: "k", AuthMethod: authMethodAPIKey, Region: "us-west-2"}
+	oauth := KiroCredentials{AccessToken: "k", Region: "us-west-2"}
+
+	if got := codeWhispererURL(apiKey); got != "https://q.us-west-2.amazonaws.com/generateAssistantResponse" {
+		t.Fatalf("expected API-key to use q.* surface, got %q", got)
+	}
+	if got := codeWhispererURL(oauth); got != "https://codewhisperer.us-west-2.amazonaws.com/generateAssistantResponse" {
+		t.Fatalf("expected OAuth token to keep codewhisperer surface, got %q", got)
+	}
+	if isCodeWhispererHost("https://q.us-west-2.amazonaws.com/generateAssistantResponse") {
+		t.Fatalf("q.* host must not be treated as codewhisperer")
+	}
+	if !isCodeWhispererHost("https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse") {
+		t.Fatalf("codewhisperer host must be detected")
 	}
 }
 
@@ -224,7 +290,7 @@ func TestHandleNonStreamRequestWithAPIKeyHeaders(t *testing.T) {
 	if upstreamReq == nil {
 		t.Fatalf("expected upstream request")
 	}
-	if got := upstreamReq.URL.String(); got != "https://codewhisperer.us-west-2.amazonaws.com/generateAssistantResponse" {
+	if got := upstreamReq.URL.String(); got != "https://q.us-west-2.amazonaws.com/generateAssistantResponse" {
 		t.Fatalf("unexpected upstream URL %q", got)
 	}
 	if got := upstreamReq.Header.Get("Authorization"); got != "Bearer kiro-api-key" {
@@ -233,8 +299,8 @@ func TestHandleNonStreamRequestWithAPIKeyHeaders(t *testing.T) {
 	if got := upstreamReq.Header.Get("tokentype"); got != "API_KEY" {
 		t.Fatalf("unexpected tokentype header %q", got)
 	}
-	if got := upstreamReq.Header.Get("X-Amz-Target"); got != "AmazonCodeWhispererStreamingService.GenerateAssistantResponse" {
-		t.Fatalf("unexpected target header %q", got)
+	if got := upstreamReq.Header.Get("X-Amz-Target"); got != "" {
+		t.Fatalf("expected no X-Amz-Target on the q.* surface, got %q", got)
 	}
 	if !strings.Contains(string(upstreamBody), `"modelId":"claude-sonnet-4.6"`) {
 		t.Fatalf("expected API-key model id in upstream body, got %s", string(upstreamBody))

@@ -19,8 +19,11 @@ func TestBuildCodeWhispererRequestRemovesIdentityForcing(t *testing.T) {
 	cwReq := buildCodeWhispererRequest(req)
 	current := cwReq.ConversationState.CurrentMessage.UserInputMessage.Content
 
-	if !strings.Contains(current, "Follow repository conventions.") {
-		t.Fatalf("expected caller system context in current message, got %q", current)
+	if cwReq.SystemPrompt != "Follow repository conventions." {
+		t.Fatalf("expected top-level systemPrompt to carry system context, got %q", cwReq.SystemPrompt)
+	}
+	if strings.Contains(current, "Follow repository conventions.") {
+		t.Fatalf("system context must live in history[0], not the current message, got %q", current)
 	}
 	if !strings.Contains(current, "Current task") {
 		t.Fatalf("expected current task content in current message, got %q", current)
@@ -33,7 +36,8 @@ func TestBuildCodeWhispererRequestRemovesIdentityForcing(t *testing.T) {
 	}
 
 	first, ok := cwReq.ConversationState.History[0].(HistoryUserMessage)
-	if !ok || first.UserInputMessage.Content != "Earlier request" {
+	wantFirst := "<context>\nFollow repository conventions.\n</context>\n\n<task>\nEarlier request\n</task>"
+	if !ok || first.UserInputMessage.Content != wantFirst {
 		t.Fatalf("unexpected first history entry: %#v", cwReq.ConversationState.History[0])
 	}
 	second, ok := cwReq.ConversationState.History[1].(HistoryAssistantMessage)
@@ -42,7 +46,7 @@ func TestBuildCodeWhispererRequestRemovesIdentityForcing(t *testing.T) {
 	}
 }
 
-func TestEnsurePayloadFitsTrimsOldestHistoryFirst(t *testing.T) {
+func TestEnsurePayloadFitsPinsFirstHistoryMessage(t *testing.T) {
 	cwReq := CodeWhispererRequest{}
 	cwReq.ConversationState.CurrentMessage.UserInputMessage.Content = "current"
 	cwReq.ConversationState.History = []any{
@@ -63,11 +67,12 @@ func TestEnsurePayloadFitsTrimsOldestHistoryFirst(t *testing.T) {
 		t.Fatalf("expected history trimming to occur, got %d entries", len(cwReq.ConversationState.History))
 	}
 
+	// history[0] is the pinned cacheable prefix: never trimmed.
 	firstRemaining := cwReq.ConversationState.History[0].(HistoryUserMessage).UserInputMessage.Content
-	lastRemaining := cwReq.ConversationState.History[len(cwReq.ConversationState.History)-1].(HistoryUserMessage).UserInputMessage.Content
-	if strings.HasPrefix(firstRemaining, "first-") {
-		t.Fatalf("expected oldest history entry to be trimmed first, got %q", firstRemaining[:16])
+	if !strings.HasPrefix(firstRemaining, "first-") {
+		t.Fatalf("expected first history entry to stay pinned, got %q", firstRemaining[:16])
 	}
+	lastRemaining := cwReq.ConversationState.History[len(cwReq.ConversationState.History)-1].(HistoryUserMessage).UserInputMessage.Content
 	if !strings.HasPrefix(lastRemaining, "fourth-") {
 		t.Fatalf("expected most recent history entry to be preserved, got %q", lastRemaining[:16])
 	}

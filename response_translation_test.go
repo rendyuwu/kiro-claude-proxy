@@ -47,11 +47,13 @@ func TestBuildAnthropicResponsePayloadUsesResolvedModel(t *testing.T) {
 	payload := buildAnthropicResponsePayload(
 		"conv-123",
 		responseModelID(cwReq, AnthropicRequest{Model: "claude-sonnet-4-5-20250929"}),
-		11,
 		translatedAnthropicResponse{
-			Blocks:       []anthropicResponseBlock{{Type: "text", Text: "done"}},
-			StopReason:   "end_turn",
-			OutputTokens: 1,
+			Blocks:                   []anthropicResponseBlock{{Type: "text", Text: "done"}},
+			StopReason:               "end_turn",
+			OutputTokens:             42,
+			InputTokens:              11,
+			CacheReadInputTokens:     9,
+			CacheCreationInputTokens: 3,
 		},
 	)
 
@@ -61,6 +63,19 @@ func TestBuildAnthropicResponsePayloadUsesResolvedModel(t *testing.T) {
 	if got := payload["stop_reason"]; got != "end_turn" {
 		t.Fatalf("expected end_turn stop reason, got %#v", got)
 	}
+	usage := payload["usage"].(map[string]any)
+	if got := usage["input_tokens"]; got != 11 {
+		t.Fatalf("expected real input_tokens in usage, got %#v", got)
+	}
+	if got := usage["output_tokens"]; got != 42 {
+		t.Fatalf("expected real output_tokens in usage, got %#v", got)
+	}
+	if got := usage["cache_read_input_tokens"]; got != 9 {
+		t.Fatalf("expected cache_read_input_tokens in usage, got %#v", got)
+	}
+	if got := usage["cache_creation_input_tokens"]; got != 3 {
+		t.Fatalf("expected cache_creation_input_tokens in usage, got %#v", got)
+	}
 }
 
 func TestBuildAnthropicStreamEventsUsesTranslatedBlocks(t *testing.T) {
@@ -69,11 +84,13 @@ func TestBuildAnthropicStreamEventsUsesTranslatedBlocks(t *testing.T) {
 			{Type: "text", Text: "Need tool"},
 			{Type: "tool_use", ToolUseID: "toolu_1", ToolName: "lookup", ToolInput: map[string]any{"query": "weather"}},
 		},
-		StopReason:   "tool_use",
-		OutputTokens: 2,
+		StopReason:           "tool_use",
+		OutputTokens:         2,
+		InputTokens:          11,
+		CacheReadInputTokens: 6,
 	}
 
-	events := buildAnthropicStreamEvents("conv-123", "msg_123", "CLAUDE_SONNET_4_5", 11, translated)
+	events := buildAnthropicStreamEvents("conv-123", "msg_123", "CLAUDE_SONNET_4_5", translated)
 	if len(events) != 10 {
 		t.Fatalf("expected 10 stream events, got %d", len(events))
 	}
@@ -81,6 +98,13 @@ func TestBuildAnthropicStreamEventsUsesTranslatedBlocks(t *testing.T) {
 	message := events[0].Data.(map[string]any)["message"].(map[string]any)
 	if got := message["model"]; got != "CLAUDE_SONNET_4_5" {
 		t.Fatalf("expected resolved model in stream message_start, got %#v", got)
+	}
+	startUsage := message["usage"].(map[string]any)
+	if got := startUsage["input_tokens"]; got != 11 {
+		t.Fatalf("expected input_tokens in message_start usage, got %#v", got)
+	}
+	if got := startUsage["cache_read_input_tokens"]; got != 6 {
+		t.Fatalf("expected cache_read_input_tokens in message_start usage, got %#v", got)
 	}
 
 	toolDelta := events[6].Data.(map[string]any)["delta"].(map[string]any)
@@ -91,6 +115,32 @@ func TestBuildAnthropicStreamEventsUsesTranslatedBlocks(t *testing.T) {
 	messageDelta := events[8].Data.(map[string]any)["delta"].(map[string]any)
 	if got := messageDelta["stop_reason"]; got != "tool_use" {
 		t.Fatalf("expected tool_use stop reason, got %#v", got)
+	}
+}
+
+func TestAssembleAnthropicResponseReadsMetricsUsage(t *testing.T) {
+	events := []protocol.SSEEvent{
+		{Event: "metrics", Data: map[string]any{
+			"type":                        "metrics",
+			"input_tokens":                100,
+			"output_tokens":               30,
+			"cache_read_input_tokens":     80,
+			"cache_creation_input_tokens": 20,
+		}},
+	}
+
+	translated := assembleAnthropicResponse(events)
+	if translated.InputTokens != 100 {
+		t.Fatalf("expected input_tokens 100 from metrics, got %d", translated.InputTokens)
+	}
+	if translated.OutputTokens != 30 {
+		t.Fatalf("expected output_tokens 30 from metrics, got %d", translated.OutputTokens)
+	}
+	if translated.CacheReadInputTokens != 80 {
+		t.Fatalf("expected cache_read_input_tokens 80 from metrics, got %d", translated.CacheReadInputTokens)
+	}
+	if translated.CacheCreationInputTokens != 20 {
+		t.Fatalf("expected cache_creation_input_tokens 20 from metrics, got %d", translated.CacheCreationInputTokens)
 	}
 }
 
